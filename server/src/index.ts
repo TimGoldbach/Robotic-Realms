@@ -22,6 +22,10 @@ interface Lobby {
   players: Player[];
   maxPlayers: number;
   started: boolean;
+  playerCards: Map<string, number[]>; // Maps player ID to their cards
+  availableCards: number[]; // Cards that haven't been dealt yet
+  currentPlayerId: string | null;
+  discardPile: number[];
 }
 
 interface Player {
@@ -31,12 +35,42 @@ interface Player {
 
 const lobbies: Map<string, Lobby> = new Map();
 
+// Initialize the deck of 52 cards
+const DECK = Array.from({ length: 52 }, (_, i) => i + 1);
+
 function generateUniquePin(): string {
   let pin: string;
   do {
     pin = Math.floor(100000 + Math.random() * 900000).toString();
   } while ([...lobbies.values()].some(lobby => lobby.pin === pin));
   return pin;
+}
+
+function dealCards(lobby: Lobby) {
+  // Reset available cards and player cards
+  lobby.availableCards = [...DECK];
+  lobby.playerCards = new Map();
+  lobby.discardPile = [];
+  lobby.currentPlayerId = lobby.players[0]?.id || null;
+
+  // Deal 7 cards to each player
+  lobby.players.forEach(player => {
+    const playerCards: number[] = [];
+    for (let i = 0; i < 7; i++) {
+      if (lobby.availableCards.length > 0) {
+        const randomIndex = Math.floor(Math.random() * lobby.availableCards.length);
+        const card = lobby.availableCards.splice(randomIndex, 1)[0];
+        playerCards.push(card);
+      }
+    }
+    lobby.playerCards.set(player.id, playerCards);
+  });
+}
+
+function nextTurn(lobby: Lobby) {
+  const currentIndex = lobby.players.findIndex(p => p.id === lobby.currentPlayerId);
+  const nextIndex = (currentIndex + 1) % lobby.players.length;
+  lobby.currentPlayerId = lobby.players[nextIndex].id;
 }
 
 io.on('connection', (socket) => {
@@ -50,7 +84,11 @@ io.on('connection', (socket) => {
       pin,
       players: [{ id: socket.id, name: playerName }],
       maxPlayers: 6,
-      started: false
+      started: false,
+      playerCards: new Map(),
+      availableCards: [],
+      currentPlayerId: null,
+      discardPile: []
     };
     console.log('Created lobby:', lobby);
     lobbies.set(lobby.id, lobby);
@@ -95,13 +133,24 @@ io.on('connection', (socket) => {
     console.log('Leaving lobby:', lobbyId);
     const lobby = lobbies.get(lobbyId);
     if (lobby) {
+      // Remove player's cards
+      lobby.playerCards.delete(socket.id);
+      // Remove player from players list
       lobby.players = lobby.players.filter(p => p.id !== socket.id);
+      
       if (lobby.players.length === 0) {
         console.log('Deleting empty lobby');
         lobbies.delete(lobbyId);
+      } else {
+        // If the game was started, set it back to not started
+        if (lobby.started) {
+          lobby.started = false;
+          lobby.availableCards = [];
+          lobby.playerCards = new Map();
+        }
+        socket.leave(lobbyId);
+        io.to(lobbyId).emit('lobbyUpdated', lobby);
       }
-      socket.leave(lobbyId);
-      io.to(lobbyId).emit('lobbyUpdated', lobby);
       io.emit('lobbyList', Array.from(lobbies.values()));
     }
   });
@@ -111,8 +160,14 @@ io.on('connection', (socket) => {
     const lobby = lobbies.get(lobbyId);
     if (lobby && !lobby.started) {
       lobby.started = true;
+      dealCards(lobby);
       io.to(lobbyId).emit('lobbyStarted');
       io.to(lobbyId).emit('lobbyUpdated', lobby);
+      // Send each player their cards
+      lobby.players.forEach(player => {
+        const playerCards = lobby.playerCards.get(player.id) || [];
+        io.to(player.id).emit('dealCards', { cards: playerCards });
+      });
     }
   });
 
@@ -120,7 +175,15 @@ io.on('connection', (socket) => {
     console.log('Getting lobby data:', lobbyId);
     const lobby = lobbies.get(lobbyId);
     if (lobby) {
-      socket.emit('lobbyData', lobby);
+      // Don't send other players' cards
+      const lobbyData = {
+        ...lobby,
+        playerCards: new Map([...lobby.playerCards].map(([id, cards]) => [
+          id,
+          id === socket.id ? cards : []
+        ]))
+      };
+      socket.emit('lobbyData', lobbyData);
     } else {
       socket.emit('lobbyError', 'Lobby not found');
     }
@@ -129,6 +192,76 @@ io.on('connection', (socket) => {
   socket.on('getLobbies', () => {
     console.log('Getting lobby list');
     socket.emit('lobbyList', Array.from(lobbies.values()));
+  });
+
+  socket.on('drawFromDeck', ({ lobbyId }) => {
+    const lobby = lobbies.get(lobbyId);
+    if (!lobby) {
+      socket.emit('lobbyError', 'Lobby not found');
+      return;
+    }
+
+    if (socket.id !== lobby.currentPlayerId) {
+      socket.emit('lobbyError', 'Not your turn');
+      return;
+    }
+
+    if (lobby.availableCards.length === 0) {
+      socket.emit('lobbyError', 'No cards left in deck');
+      return;
+    }
+
+    // Draw a random card from the available cards
+    const randomIndex = Math.floor(Math.random() * lobby.availableCards.length);
+    const drawnCard = lobby.availableCards[randomIndex];
+    
+    // Remove the drawn card from available cards
+    lobby.availableCards.splice(randomIndex, 1);
+    
+    // Add the card to the player's hand
+    const playerCards = lobby.playerCards.get(socket.id) || [];
+    playerCards.push(drawnCard);
+    lobby.playerCards.set(socket.id, playerCards);
+
+    // Broadcast the updated lobby state
+    io.to(lobbyId).emit('lobbyUpdated', lobby);
+  });
+
+  socket.on('drawFromDiscard', ({ lobbyId }: { lobbyId: string }) => {
+    const lobby = lobbies.get(lobbyId);
+    if (!lobby || !lobby.started || lobby.currentPlayerId !== socket.id || lobby.discardPile.length === 0) {
+      socket.emit('lobbyError', 'Invalid move');
+      return;
+    }
+
+    const card = lobby.discardPile.pop()!;
+    const playerCards = lobby.playerCards.get(socket.id) || [];
+    playerCards.push(card);
+    lobby.playerCards.set(socket.id, playerCards);
+    
+    io.to(lobbyId).emit('lobbyUpdated', lobby);
+    io.to(socket.id).emit('dealCards', { cards: playerCards });
+  });
+
+  socket.on('discardCard', ({ lobbyId, cardIndex }: { lobbyId: string, cardIndex: number }) => {
+    const lobby = lobbies.get(lobbyId);
+    if (!lobby || !lobby.started || lobby.currentPlayerId !== socket.id) {
+      socket.emit('lobbyError', 'Invalid move');
+      return;
+    }
+
+    const playerCards = lobby.playerCards.get(socket.id) || [];
+    if (cardIndex >= 0 && cardIndex < playerCards.length) {
+      const card = playerCards.splice(cardIndex, 1)[0];
+      lobby.discardPile.push(card);
+      lobby.playerCards.set(socket.id, playerCards);
+      
+      // Move to next player's turn
+      nextTurn(lobby);
+      
+      io.to(lobbyId).emit('lobbyUpdated', lobby);
+      io.to(socket.id).emit('dealCards', { cards: playerCards });
+    }
   });
 
   socket.on('disconnect', () => {

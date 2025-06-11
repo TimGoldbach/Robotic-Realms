@@ -17,6 +17,9 @@ interface Lobby {
   players: { id: string; name: string }[];
   maxPlayers: number;
   started: boolean;
+  playerCards?: Map<string, number[]>;
+  currentPlayerId: string | null;
+  discardPile: number[];
 }
 
 // Home Component
@@ -209,14 +212,21 @@ function LobbyRoom() {
     socket.on('lobbyData', (data: Lobby) => {
       setLobby(data);
       setStarted(data.started);
+      if (data.started) {
+        navigate(`/game/${lobbyId}`);
+      }
     });
 
     socket.on('lobbyUpdated', (data: Lobby) => {
       setLobby(data);
+      if (data.started) {
+        navigate(`/game/${lobbyId}`);
+      }
     });
 
     socket.on('lobbyStarted', () => {
       setStarted(true);
+      navigate(`/game/${lobbyId}`);
     });
 
     socket.on('lobbyError', (error: string) => {
@@ -328,6 +338,223 @@ function LobbyRoom() {
   );
 }
 
+// Game Component
+function Game() {
+  const [lobby, setLobby] = useState<Lobby | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [playerCards, setPlayerCards] = useState<number[]>([]);
+  const [hasDrawnCard, setHasDrawnCard] = useState(false);
+  const { lobbyId } = useParams<{ lobbyId: string }>();
+  const navigate = useNavigate();
+  const socket = useSocket();
+  const playerName = localStorage.getItem('playerName') || '';
+
+  const isCurrentPlayer = socket?.id === lobby?.currentPlayerId;
+
+  // Reset hasDrawnCard when turn changes
+  useEffect(() => {
+    if (lobby && socket) {
+      const isPlayerTurn = socket.id === lobby.currentPlayerId;
+      if (!isPlayerTurn) {
+        setHasDrawnCard(false);
+      }
+    }
+  }, [lobby?.currentPlayerId, socket]);
+
+  useEffect(() => {
+    if (!socket || !lobbyId) return;
+
+    socket.emit('getLobby', { lobbyId });
+
+    socket.on('lobbyData', (data: Lobby) => {
+      if (!data.started) {
+        navigate(`/lobby/${lobbyId}`);
+        return;
+      }
+      setLobby(data);
+      // Get player's cards from the lobby data
+      const playerId = socket.id;
+      if (playerId && data.playerCards) {
+        const cards = data.playerCards.get(playerId) || [];
+        setPlayerCards(cards);
+      }
+    });
+
+    socket.on('lobbyUpdated', (data: Lobby) => {
+      if (!data.started) {
+        navigate(`/lobby/${lobbyId}`);
+        return;
+      }
+      setLobby(data);
+      // Get player's cards from the lobby data
+      const playerId = socket.id;
+      if (playerId && data.playerCards) {
+        const cards = data.playerCards.get(playerId) || [];
+        setPlayerCards(cards);
+      }
+    });
+
+    socket.on('dealCards', ({ cards }: { cards: number[] }) => {
+      console.log('Received cards:', cards);
+      setPlayerCards(cards);
+      setHasDrawnCard(true);
+    });
+
+    socket.on('lobbyError', (error: string) => {
+      setError(error);
+      setTimeout(() => {
+        setError(null);
+      }, 3000);
+    });
+
+    return () => {
+      socket.off('lobbyData');
+      socket.off('lobbyUpdated');
+      socket.off('dealCards');
+      socket.off('lobbyError');
+    };
+  }, [socket, lobbyId, navigate]);
+
+  const drawFromDeck = () => {
+    if (socket && lobbyId && isCurrentPlayer && !hasDrawnCard) {
+      socket.emit('drawFromDeck', { lobbyId });
+      setHasDrawnCard(true);
+    }
+  };
+
+  const drawFromDiscard = () => {
+    if (socket && lobbyId && isCurrentPlayer && !hasDrawnCard && lobby?.discardPile?.length > 0) {
+      socket.emit('drawFromDiscard', { lobbyId });
+      setHasDrawnCard(true);
+    }
+  };
+
+  const discardCard = (index: number) => {
+    if (socket && lobbyId && isCurrentPlayer && hasDrawnCard) {
+      socket.emit('discardCard', { lobbyId, cardIndex: index });
+      setHasDrawnCard(false);
+    }
+  };
+
+  const leaveGame = () => {
+    if (socket && lobbyId) {
+      socket.emit('leaveLobby', { lobbyId });
+      navigate(`/lobby/${lobbyId}`);
+    }
+  };
+
+  if (error) {
+    return (
+      <div className="container mx-auto p-4">
+        <div className="robot-card p-6 rounded-lg bg-red-900/20 border border-red-500/20">
+          <strong className="font-bold text-red-400">Error: </strong>
+          <span className="text-red-300">{error}</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (!lobby) {
+    return (
+      <div className="container mx-auto p-4 flex items-center justify-center min-h-screen">
+        <div className="text-center">
+          <div className="loading-spinner w-12 h-12 rounded-full mb-4"></div>
+          <span className="text-gray-400">Loading game...</span>
+        </div>
+      </div>
+    );
+  }
+
+  const currentPlayer = lobby.players.find(p => p.id === lobby.currentPlayerId);
+
+  return (
+    <div className="container mx-auto p-4 min-h-screen">
+      <div className="robot-card p-6 rounded-lg">
+        <h1 className="text-4xl font-bold mb-6 robot-title">Game Room</h1>
+        
+        <div className="mb-8">
+          <h2 className="text-2xl font-semibold mb-4">Players</h2>
+          <div className="player-list">
+            {lobby.players.map((player) => (
+              <div 
+                key={player.id} 
+                className={`player-item ${player.name === playerName ? 'player-item-self' : ''} ${player.id === lobby.currentPlayerId ? 'border-yellow-500' : ''}`}
+              >
+                <span className="status-indicator"></span>
+                {player.name}
+                {player.name === playerName && (
+                  <span className="ml-2 text-xs text-blue-400">(You)</span>
+                )}
+                {player.id === lobby.currentPlayerId && (
+                  <span className="ml-2 text-xs text-yellow-400">(Current Turn)</span>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {isCurrentPlayer && !hasDrawnCard && (
+          <div className="mb-8">
+            <h2 className="text-2xl font-semibold mb-4">Your Turn - Draw a Card</h2>
+            <div className="flex gap-4">
+              <button
+                onClick={drawFromDeck}
+                className="robot-button flex-1 bg-gradient-to-r from-blue-500 to-blue-600 text-white px-6 py-3 rounded-lg font-semibold hover:from-blue-600 hover:to-blue-700 transition-all"
+              >
+                Draw from Deck
+              </button>
+            </div>
+          </div>
+        )}
+
+        {isCurrentPlayer && hasDrawnCard && (
+          <div className="mb-8">
+            <h2 className="text-2xl font-semibold mb-4">Select a card to discard</h2>
+          </div>
+        )}
+
+        <div className="mb-8">
+          <h2 className="text-2xl font-semibold mb-4">Your Cards</h2>
+          <div className="grid grid-cols-7 gap-4">
+            {playerCards.map((card, index) => (
+              <div
+                key={index}
+                onClick={() => discardCard(index)}
+                className={`robot-card p-4 rounded-lg text-center border transition-colors
+                  ${isCurrentPlayer && hasDrawnCard ? 'cursor-pointer hover:border-blue-500/50' : 'cursor-default border-gray-700/50'}`}
+              >
+                {card}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {lobby.discardPile?.length > 0 && (
+          <div className="mb-8">
+            <h2 className="text-2xl font-semibold mb-4">Discard Pile</h2>
+            <div 
+              onClick={drawFromDiscard}
+              className={`robot-card p-4 rounded-lg text-center border transition-colors
+                ${isCurrentPlayer && !hasDrawnCard ? 'cursor-pointer hover:border-blue-500/50' : 'cursor-default border-gray-700/50'}`}
+            >
+              {lobby.discardPile[lobby.discardPile.length - 1]}
+            </div>
+          </div>
+        )}
+
+        <div className="flex gap-4">
+          <button
+            onClick={leaveGame}
+            className="robot-button flex-1 bg-gradient-to-r from-red-500 to-red-600 text-white px-6 py-3 rounded-lg font-semibold"
+          >
+            Leave Game
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // App Component
 function App() {
   const [socket, setSocket] = useState<Socket | null>(null);
@@ -367,6 +594,7 @@ function App() {
         <Routes>
           <Route path="/" element={<Home />} />
           <Route path="/lobby/:lobbyId" element={<LobbyRoom />} />
+          <Route path="/game/:lobbyId" element={<Game />} />
         </Routes>
       </Router>
     </SocketContext.Provider>
